@@ -15,6 +15,9 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/reference"
 
 	"github.com/linki/chaoskube/util"
@@ -50,6 +53,8 @@ type Chaoskube struct {
 	GracePeriod time.Duration
 	// a function to retrieve the current time
 	Now func() time.Time
+
+	EventRecorder record.EventRecorder
 }
 
 var (
@@ -72,8 +77,11 @@ var (
 // * a time zone to apply to the aforementioned time-based filters
 // * a logger implementing logrus.FieldLogger to send log output to
 // * whether to enable/disable dry-run mode
-// * whether to enable/disable event creation
-func New(client kubernetes.Interface, labels, annotations, namespaces labels.Selector, excludedWeekdays []time.Weekday, excludedTimesOfDay []util.TimePeriod, excludedDaysOfYear []time.Time, timezone *time.Location, minimumAge time.Duration, logger log.FieldLogger, dryRun bool, createEvent bool, gracePeriod time.Duration) *Chaoskube {
+func New(client kubernetes.Interface, labels, annotations, namespaces labels.Selector, excludedWeekdays []time.Weekday, excludedTimesOfDay []util.TimePeriod, excludedDaysOfYear []time.Time, timezone *time.Location, minimumAge time.Duration, logger log.FieldLogger, dryRun bool, gracePeriod time.Duration) *Chaoskube {
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events(v1.NamespaceAll)})
+	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "chaoskube"})
+
 	return &Chaoskube{
 		Client:             client,
 		Labels:             labels,
@@ -84,9 +92,9 @@ func New(client kubernetes.Interface, labels, annotations, namespaces labels.Sel
 		ExcludedDaysOfYear: excludedDaysOfYear,
 		Timezone:           timezone,
 		MinimumAge:         minimumAge,
+		EventRecorder:      recorder,
 		Logger:             logger,
 		DryRun:             dryRun,
-		CreateEvent:        createEvent,
 		GracePeriod:        gracePeriod,
 		Now:                time.Now,
 	}
@@ -205,38 +213,14 @@ func (c *Chaoskube) DeletePod(victim v1.Pod) error {
 		return err
 	}
 
-	err = c.CreateDeleteEvent(victim)
-	if err != nil {
-		c.Logger.WithField("err", err).Error("failed to create deletion event")
-	}
-
-	return nil
-}
-
-// CreateDeleteEvent creates an event in victims namespace with an deletion message.
-func (c *Chaoskube) CreateDeleteEvent(victim v1.Pod) error {
-	ref, err := reference.GetReference(scheme.Scheme, victim.DeepCopyObject())
+	ref, err := reference.GetReference(scheme.Scheme, &victim)
 	if err != nil {
 		return err
 	}
 
-	t := metav1.Time{Time: c.Now()}
-	_, err = c.Client.CoreV1().Events(victim.Namespace).Create(&v1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.chaos.%x", victim.Name, t.UnixNano()),
-			Namespace: victim.Namespace,
-		},
-		InvolvedObject: *ref,
-		Reason:         "Chaos",
-		Message:        fmt.Sprintf("Deleted pod %s", victim.Name),
-		FirstTimestamp: t,
-		LastTimestamp:  t,
-		Count:          1,
-		Action:         "Deleted",
-		Type:           v1.EventTypeNormal,
-	})
+	c.EventRecorder.Event(ref, v1.EventTypeNormal, "Killing", "Pod was deleted by chaoskube to introduce chaos.")
 
-	return err
+	return nil
 }
 
 // filterByNamespaces filters a list of pods by a given namespace selector.
